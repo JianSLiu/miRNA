@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
+from utils import Get_rel_dic
 
 # from main import device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,22 +75,67 @@ class SMultiHeadAttention(nn.Module):
         return output
 
 
-class STransformer(nn.Module):
+class nconv(nn.Module):
+    def __init__(self):
+        super(nconv,self).__init__()
+
+    def forward(self,x, A):
+        x = torch.einsum('ncvl,vw->ncwl',(x,A))
+        return x.contiguous()
+
+class linear(nn.Module):
+    def __init__(self,c_in,c_out):
+        super(linear,self).__init__()
+        self.mlp = torch.nn.Conv2d(c_in, c_out, kernel_size=(1, 1), padding=(0,0), stride=(1,1), bias=True)
+
+    def forward(self,x):
+        return self.mlp(x)
+
+class gcn(nn.Module):
+    def __init__(self,c_in,c_out,dropout,support_len=3,order=2):
+        super(gcn,self).__init__()
+        self.nconv = nconv()
+        c_in = (order*support_len+1)*c_in
+        self.mlp = linear(c_in,c_out)
+        self.dropout = dropout
+        self.order = order
+
+    def forward(self,x,support):
+        x = x.permute(0, 3, 1, 2)
+        out = [x]
+        support = [support]
+        for a in support:
+            x1 = self.nconv(x,a)
+            out.append(x1)
+            for k in range(2, self.order + 1):
+                x2 = self.nconv(x1,a)
+                out.append(x2)
+                x1 = x2
+
+        h = torch.cat(out,dim=1)
+        h = self.mlp(h)
+        h = F.dropout(h, self.dropout, training=self.training)
+        return h.permute(0,2,3,1)
+
+
+class Global(nn.Module):
     def __init__(self, embed_size, heads, adj, dropout, forward_expansion):
-        super(STransformer, self).__init__()
+        super(Global, self).__init__()
         # Spatial Embedding
         self.adj = adj
-        self.D_S = adj.to(device)
-        # elf.D_S = adj
-        self.embed_liner = nn.Linear(adj.shape[0], embed_size)
 
-        self.attention = SMultiHeadAttention(embed_size, heads)
+        self.gcnF = gcn(embed_size,embed_size,dropout = dropout,support_len=1,order=2)
+        self.gcnD = gcn(embed_size, embed_size, dropout=dropout, support_len=1, order=2)
+
+        self.Att1 = SMultiHeadAttention(embed_size, heads)
+        self.Att2 = SMultiHeadAttention(embed_size, heads)
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
         self.norm3 = nn.LayerNorm(embed_size)
         self.norm4 = nn.LayerNorm(embed_size)
         self.norm5 = nn.LayerNorm(embed_size)
         self.norm6 = nn.LayerNorm(embed_size)
+
         self.feed_forward = nn.Sequential(
             nn.Linear(embed_size, forward_expansion * embed_size),
             nn.ReLU(),
@@ -101,79 +146,95 @@ class STransformer(nn.Module):
             nn.ReLU(),
             nn.Linear(forward_expansion * embed_size, embed_size),
         )
-        # 调用GCN
-        self.norm_adj = nn.InstanceNorm2d(1)  # 对邻接矩阵归一化
+
 
         self.dropout = nn.Dropout(dropout)
         self.dropout1 = nn.Dropout(dropout)
-        self.fs = nn.Linear(embed_size, embed_size)
-        self.fg = nn.Linear(embed_size, embed_size)
 
-        self.ff1 = nn.Linear(embed_size, embed_size)
-        self.ff2 = nn.Linear(embed_size, embed_size)
 
-        self.E = nn.Sequential(
-            nn.Linear(adj.shape[0], embed_size),
-            nn.ReLU(),
-            nn.Linear(embed_size, embed_size)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_size, embed_size * 6),
+            nn.Linear(embed_size * 6, embed_size)
         )
-        #self.Att = Attention(d_model=embed_size * 12, d_k=embed_size * 2, d_v=embed_size * 2, h=heads, dropout=0)
-        self.Att = SMultiHeadAttention(embed_size, heads)
+
     def forward(self, value, key, query):
-        B, N, T, C = query.shape
+        B, N, T, H = query.shape
         query1 = query
         # GCN 部分
-        X_G = torch.Tensor(B, N, 0, C).to(device)
-        # self.adj = self.adj.unsqueeze(0).unsqueeze(0)
-        # self.adj = self.norm_adj(self.adj)
-        # self.adj = self.adj.squeeze(0).squeeze(0)
 
-        for t in range(query.shape[2]):
-            # o = self.gcn(query[:, :, t, :], self.adj)  # [B, N, C]
-            # o = o.unsqueeze(2)  # shape [N, 1, C] [B, N, 1, C]
-            # #             print(o.shape)
-            # X_G = torch.cat((X_G, o), dim=2)
-            x = query[:, :, t, :]
-            A = self.adj.to(device)
-            D = (A.sum(-1) ** -0.5)
-            D[torch.isinf(D)] = 0.
-            D = torch.diag_embed(D)
-            A = torch.matmul(torch.matmul(D, A), D)
-            x = torch.relu(self.ff1(torch.matmul(A, x)))
-            # x = torch.softmax(self.ff2(torch.matmul(A, x)), dim=-1)
-            x = x.unsqueeze(2)
-            X_G = torch.cat((X_G, x), dim=2)
-        # 最后X_G [B, N, T, C]
 
-        #         print('After GCN:')
-        #         print(X_G)
-        # Spatial Transformer 部分
-        X_E = self.E(self.adj.to(device)).reshape(N, T, C).unsqueeze(0)
-        query = self.norm5(query + X_E)
-        attention = self.attention(query, query, query)  # (B, N, T, C)
-        # Add skip connection, run through normalization and finally dropout
-        x = self.dropout(self.norm1(attention + query))
+        X_D = self.gcnD(query, self.adj.to(device))
+
+
+        R = query.reshape(B, N, T*H)
+        R = self.ff(R)
+        R = R.sum(dim=0)
+        A = torch.matmul(R, R.transpose(-1, -2))
+        R = torch.relu(torch.softmax(A, -1)) + torch.eye(A.shape[1]).to(device)
+
+
+        X_F = self.gcnF(query, R)
+
+        X_DF = torch.tanh(X_D)*torch.sigmoid(X_F)
+
+        query = self.norm1(query + X_DF )
+        attention = self.Att1(query, query, query)  # (B, N, T, C)
+        x = self.dropout(self.norm2(attention + query))
         forward = self.feed_forward(x)
-        U_S = self.dropout(self.norm2(forward + x))
-
-        X_G = self.norm6(query1+X_G)
-        #Attention1 = self.Att(X_G.reshape(B, N, -1), X_G.reshape(B, N, -1), X_G.reshape(B, N, -1)).reshape(-1, N, T, C)
-        Attention1 = self.Att(X_G,X_G,X_G)
-        y = self.dropout(self.norm3(Attention1 + X_G))
-        forward1 = self.feed_forward1(y)
-        X_G = self.dropout(self.norm4(y + forward1))
-        # 融合 STransformer and GCN
+        X_DF  = self.dropout(self.norm3(forward + x))
 
 
-
-        g = torch.sigmoid(self.fs(U_S) + self.fg(X_G))  # (7)
-        out = g * U_S + (1 - g) * X_G  # (8)
-
-        return out  # (B, N, T, C)
+        return X_DF  # (B, N, T, C)
 
 
+class Local(nn.Module):
+    def __init__(self, embed_size, heads,innode,outnode, dropout, forward_expansion):
+        super(Local, self).__init__()
+        self.miRNA = outnode
+        self.mRNA = innode-outnode
+        self.rel_dic = Get_rel_dic(self.mRNA,self.miRNA)
+        self.conv1 = nn.Conv2d(1,64,1,1)
+        self.conv2 = nn.Conv2d(64,64,1,1)
+        self.conv3 = nn.Conv2d(64, 1, 1, 1)
+        self.attention = SMultiHeadAttention(embed_size, heads)
+        self.norm1 = nn.LayerNorm(embed_size)
+        self.norm2 = nn.LayerNorm(embed_size)
 
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embed_size, forward_expansion * embed_size),
+            nn.ReLU(),
+            nn.Linear(forward_expansion * embed_size, embed_size),
+        )
+        self.dropout = nn.Dropout(dropout)
 
+        self.out = nn.Sequential(
+            nn.Linear(100, 64),
+            nn.ReLU(),
+            nn.Linear(64,1),
+        )
+    def forward(self,x):
+        D = torch.zeros((x.shape[0], 70, 100)).to(device)
+        for index in range(self.mRNA,self.mRNA+self.miRNA):
+            temp = x[:,self.rel_dic[index]]
+            B,N = temp.shape
+            D[0:B, index - self.mRNA, 0:N] += temp
+
+        x = D.unsqueeze(-1).permute(0,3,1,2)
+
+        x = self.conv1(x)
+        x = self.conv2(x).permute(0,2,3,1)
+
+        x_a = self.attention(x,x,x)
+
+        x_a = self.dropout(self.norm1(x_a+x))
+        feed = self.feed_forward(x_a)
+        x = self.dropout(self.norm2(feed+x_a)).permute(0,3,1,2)
+
+        x = self.conv3(x).squeeze(1)
+
+        x = self.out(x).squeeze(-1)
+
+        return x
 
 class TBlock(nn.Module):
     def __init__(
@@ -191,7 +252,7 @@ class TBlock(nn.Module):
         self.conv4 = nn.Conv2d(in_channels, embed_size, 1)
         self.conv5 = nn.Conv2d(in_channels, embed_size, 1)
         # embed_size, heads, adj, dropout, forward_expansion
-        self.S = STransformer(embed_size, heads, adj, dropout, forward_expansion)
+        self.S =Global(embed_size, heads, adj, dropout, forward_expansion)
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
         self.norm3 = nn.LayerNorm(embed_size)
@@ -203,10 +264,6 @@ class TBlock(nn.Module):
         self.relu = nn.ReLU()
     def forward(self, x):
         input_Transformer = x
-
-        # 位置潜入
-        B, N, T, H = input_Transformer.shape
-        # input_Transformer = self.positional_encoding(input_Transformer)
         # **********************************************************************************************
         # 提取空间信息
         output_S = self.S(input_Transformer, input_Transformer, input_Transformer)
@@ -232,35 +289,61 @@ class STTF(nn.Module):
 
     ):
         super(STTF, self).__init__()
+        self.innode = innode
+        self.outnode = outnode
         self.conv1 = nn.Conv2d(in_channels, embed_size, 1)
-        self.conv2 = nn.Conv2d(innode, outnode, 1)
+        self.conv2 = nn.Conv2d(64, 1, 1)
         self.conv3 = nn.Conv2d(embed_size, 1, 1)
         self.relu = nn.ReLU()
         self.ST1 = TBlock(adj,in_channels,embed_size,heads,forward_expansion,dropout=dropout)
         self.ST2 = TBlock(adj, in_channels, embed_size, heads,forward_expansion, dropout=dropout)
         self.norm1 = nn.LayerNorm(embed_size)
+        #embed_size, heads, adj, dropout, forward_expansio
+        self.Local = Local(embed_size,heads,innode,outnode,dropout,forward_expansion)
+
+
+        self.fc1 = nn.Sequential(
+            nn.Linear(innode,512),
+            nn.ReLU(),
+            nn.Linear(512,70),
+                                 )
+
+        self.fs = nn.Linear(outnode, outnode)
+        self.fg = nn.Linear(outnode, outnode)
 
     def forward(self, x):
+        x_L = x[:,0:self.innode-self.outnode]
         x = x.unsqueeze(1)
         x = x.permute(0, 2, 1).unsqueeze(1)
         input_Transformer = self.conv1(x)
         input_Transformer = input_Transformer.permute(0, 2, 3, 1)
         out = self.ST1(input_Transformer)
-        out = self.norm1(out+input_Transformer)
-        out = self.ST2(out)
+        L = self.Local(x_L)
+        # out = self.norm1(out+input_Transformer)
+        # out = self.ST2(out)
 
         #####################################
-        #out = out.permute(0, 2, 1, 3)
-        out = self.relu(self.conv2(out))
-        out = out.permute(0, 3, 2, 1)
-        out = self.conv3(out)
-        out = out.squeeze(1)
-        return out.permute(0, 2, 1).squeeze(-1)
+        out = out.permute(0, 3, 1, 2)
+        out = self.relu(self.conv2(out)).squeeze(-1).squeeze(1)
+
+        out = self.fc1(out)
+
+        g = torch.sigmoid(self.fg(out)+self.fs(L))
+
+        out = g*out+(1-g)*L
+
+        return out
 
 
 #####################################
-# adj = torch.randn(200,200)
+#adj = torch.randn(200,200)
 # model = STTF(adj,200,100,1,64,4,4,0)
 #
 # x = torch.randn(1,200)
 # print(model(x))
+#embed_size, heads, adj, dropout, forward_expansion):
+# L = Local(64,4,adj,0,4)
+# x = torch.randn(2,4880)
+# print(x.shape)
+# M = L(x)
+

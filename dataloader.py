@@ -3,7 +3,7 @@ import pandas as pd
 ##########################
 
 
-def preprocess_data():
+def preprocess_data(mRNA_num):
     miRNA = pd.read_csv("data_sub/miRNA.csv")
     mRNA = pd.read_csv("data_sub/mRNA.csv")
     print(miRNA.iloc[:, 1:])
@@ -19,10 +19,10 @@ def preprocess_data():
     print(data.shape)
 
     mask = np.ones(data.shape, dtype=np.float32)
-    mask[:, 4880:] = 0
+    mask[:, mRNA_num:] = 0
     print(mask)
     Data_X = data*mask
-    Data_Y = data[:,4880:]
+    Data_Y = data[:,mRNA_num:]
     print(Data_X.shape)
     print(Data_Y.shape)
     return Data_X,Data_Y
