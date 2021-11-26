@@ -27,7 +27,7 @@ def get_adjacency_matrix(distance_df_filename, num_of_vertices,
             id_dict = {int(i): idx
                        for idx, i in enumerate(f.read().strip().split('\n'))}
         with open(distance_df_filename, 'r') as f:
-            f.readline()
+            #f.readline()
             reader = csv.reader(f)
             for row in reader:
                 if len(row) != 2:
